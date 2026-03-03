@@ -1,6 +1,13 @@
 const vscode = require('vscode');
 const http = require('http');
 
+let WebSocket;
+try {
+    WebSocket = require('ws');
+} catch (e) {
+    // ws module not available, will be handled when CDP features are used
+}
+
 let autoAcceptInterval = null;
 let enabled = true;
 let autoRetryEnabled = true;
@@ -11,6 +18,7 @@ let statusBarItem;
 let retryStatusBarItem;
 let lastRetryAttempt = 0;
 let outputChannel;
+let isLoopBusy = false;
 
 function activate(context) {
     // Create output channel for logging
@@ -121,9 +129,7 @@ function activate(context) {
             cmd.toLowerCase().includes('cockpit')
         );
 
-        const outputChannel = vscode.window.createOutputChannel('Antigravity Commands');
-        outputChannel.clear();
-        outputChannel.appendLine('=== Antigravity Related Commands ===\n');
+        outputChannel.appendLine('\n=== Antigravity Related Commands ===\n');
         antigravityCommands.sort().forEach(cmd => {
             outputChannel.appendLine(cmd);
         });
@@ -158,9 +164,14 @@ function activate(context) {
 
 function loadSettings() {
     const config = vscode.workspace.getConfiguration('antigravity-auto-accept');
-    cdpPort = config.get('cdpPort', 9222);
-    autoRetryEnabled = config.get('autoRetryEnabled', true);
-    retryMaxCount = config.get('retryMaxCount', 10);
+
+    const rawPort = config.get('cdpPort', 9222);
+    cdpPort = (Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535) ? rawPort : 9222;
+
+    autoRetryEnabled = typeof config.get('autoRetryEnabled') === 'boolean' ? config.get('autoRetryEnabled') : true;
+
+    const rawMaxCount = config.get('retryMaxCount', 10);
+    retryMaxCount = (Number.isInteger(rawMaxCount) && rawMaxCount >= 0) ? rawMaxCount : 10;
 }
 
 function updateStatusBar() {
@@ -210,7 +221,12 @@ function getCDPTargets() {
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 try {
-                    resolve(JSON.parse(data));
+                    const parsed = JSON.parse(data);
+                    if (!Array.isArray(parsed)) {
+                        reject(new Error('CDP targets response is not an array'));
+                        return;
+                    }
+                    resolve(parsed);
                 } catch (e) {
                     reject(e);
                 }
@@ -265,59 +281,76 @@ function sendCDPCommand(targetId, method, params = {}) {
  */
 function executeScriptInTarget(wsUrl, script) {
     return new Promise((resolve, reject) => {
-        // Use native WebSocket-like approach with http upgrade
-        // For simplicity, we'll use a different approach: 
-        // Fetch API is not available in Node, so we use http raw request
+        if (!WebSocket) {
+            reject(new Error('WebSocket module (ws) is not available'));
+            return;
+        }
 
-        const url = new URL(wsUrl);
-        const WebSocket = require('ws');
+        let ws;
+        let resolved = false;
+        let timeoutHandle;
 
         try {
-            const ws = new WebSocket(wsUrl);
-            let resolved = false;
-
-            ws.on('open', () => {
-                ws.send(JSON.stringify({
-                    id: 1,
-                    method: 'Runtime.evaluate',
-                    params: {
-                        expression: script,
-                        returnByValue: true
-                    }
-                }));
-            });
-
-            ws.on('message', (data) => {
-                if (!resolved) {
-                    resolved = true;
-                    try {
-                        const response = JSON.parse(data.toString());
-                        resolve(response);
-                    } catch (e) {
-                        resolve(null);
-                    }
-                    ws.close();
-                }
-            });
-
-            ws.on('error', (err) => {
-                if (!resolved) {
-                    resolved = true;
-                    reject(err);
-                }
-            });
-
-            // Timeout
-            setTimeout(() => {
-                if (!resolved) {
-                    resolved = true;
-                    ws.close();
-                    reject(new Error('WebSocket timeout'));
-                }
-            }, 3000);
+            ws = new WebSocket(wsUrl);
         } catch (e) {
             reject(e);
+            return;
         }
+
+        function cleanup() {
+            if (timeoutHandle) {
+                clearTimeout(timeoutHandle);
+                timeoutHandle = null;
+            }
+            try {
+                if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+                    ws.close();
+                }
+            } catch (e) {
+                // Ignore cleanup errors
+            }
+        }
+
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                id: 1,
+                method: 'Runtime.evaluate',
+                params: {
+                    expression: script,
+                    returnByValue: true
+                }
+            }));
+        });
+
+        ws.on('message', (data) => {
+            if (!resolved) {
+                resolved = true;
+                try {
+                    const response = JSON.parse(data.toString());
+                    resolve(response);
+                } catch (e) {
+                    resolve(null);
+                }
+                cleanup();
+            }
+        });
+
+        ws.on('error', (err) => {
+            if (!resolved) {
+                resolved = true;
+                reject(err);
+                cleanup();
+            }
+        });
+
+        // Timeout
+        timeoutHandle = setTimeout(() => {
+            if (!resolved) {
+                resolved = true;
+                cleanup();
+                reject(new Error('WebSocket timeout'));
+            }
+        }, 3000);
     });
 }
 
@@ -453,56 +486,69 @@ async function clickRetryViaCDP() {
 }
 
 function startLoop() {
+    // Prevent multiple intervals from being created
+    if (autoAcceptInterval) {
+        return;
+    }
+
     autoAcceptInterval = setInterval(async () => {
         if (!enabled) return;
 
-        // ========== AUTO-ACCEPT AGENT STEPS ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.acceptAgentStep');
-        } catch (e) { }
+        // Guard against re-entrant execution if previous iteration is still running
+        if (isLoopBusy) return;
+        isLoopBusy = true;
 
-        // ========== AUTO-ACCEPT TERMINAL COMMANDS ==========
         try {
-            await vscode.commands.executeCommand('antigravity.terminal.accept');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.terminalCommand.accept');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.command.accept');
-        } catch (e) { }
+            // ========== AUTO-ACCEPT AGENT STEPS ==========
+            try {
+                await vscode.commands.executeCommand('antigravity.agent.acceptAgentStep');
+            } catch (e) { }
 
-        // ========== AUTO-CONFIRM STEP EXECUTION ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.confirmStep');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.confirm');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.confirm');
-        } catch (e) { }
+            // ========== AUTO-ACCEPT TERMINAL COMMANDS ==========
+            try {
+                await vscode.commands.executeCommand('antigravity.terminal.accept');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.terminalCommand.accept');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.command.accept');
+            } catch (e) { }
 
-        // ========== AUTO-ALLOW PERMISSIONS ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.allowOnce');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.allowConversation');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.allowOnce');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.allowConversation');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.allow');
-        } catch (e) { }
+            // ========== AUTO-CONFIRM STEP EXECUTION ==========
+            try {
+                await vscode.commands.executeCommand('antigravity.agent.confirmStep');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('agCockpit.confirm');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.confirm');
+            } catch (e) { }
 
-        // ========== AUTO-RETRY VIA CDP ==========
-        if (autoRetryEnabled) {
-            await clickRetryViaCDP();
+            // ========== AUTO-ALLOW PERMISSIONS ==========
+            try {
+                await vscode.commands.executeCommand('antigravity.agent.allowOnce');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.agent.allowConversation');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('agCockpit.allowOnce');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('agCockpit.allowConversation');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.allow');
+            } catch (e) { }
+
+            // ========== AUTO-RETRY VIA CDP ==========
+            if (autoRetryEnabled) {
+                await clickRetryViaCDP();
+            }
+        } finally {
+            isLoopBusy = false;
         }
     }, 500);
 }
@@ -510,7 +556,9 @@ function startLoop() {
 function deactivate() {
     if (autoAcceptInterval) {
         clearInterval(autoAcceptInterval);
+        autoAcceptInterval = null;
     }
+    isLoopBusy = false;
 }
 
 module.exports = {
