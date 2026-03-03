@@ -129,7 +129,8 @@ function activate(context) {
             cmd.toLowerCase().includes('cockpit')
         );
 
-        outputChannel.appendLine('\n=== Antigravity Related Commands ===\n');
+        outputChannel.clear();
+        outputChannel.appendLine('=== Antigravity Related Commands ===\n');
         antigravityCommands.sort().forEach(cmd => {
             outputChannel.appendLine(cmd);
         });
@@ -168,7 +169,8 @@ function loadSettings() {
     const rawPort = config.get('cdpPort', 9222);
     cdpPort = (Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535) ? rawPort : 9222;
 
-    autoRetryEnabled = typeof config.get('autoRetryEnabled') === 'boolean' ? config.get('autoRetryEnabled') : true;
+    const rawAutoRetry = config.get('autoRetryEnabled', true);
+    autoRetryEnabled = typeof rawAutoRetry === 'boolean' ? rawAutoRetry : true;
 
     const rawMaxCount = config.get('retryMaxCount', 10);
     retryMaxCount = (Number.isInteger(rawMaxCount) && rawMaxCount >= 0) ? rawMaxCount : 10;
@@ -303,7 +305,8 @@ function executeScriptInTarget(wsUrl, script) {
                 timeoutHandle = null;
             }
             try {
-                if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+                // Use numeric constants (0=CONNECTING, 1=OPEN) for safety
+                if (ws.readyState === 1 || ws.readyState === 0) {
                     ws.close();
                 }
             } catch (e) {
