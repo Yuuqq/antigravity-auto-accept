@@ -15,7 +15,7 @@ However, there are notable reliability, performance, and memory-leak issues that
 ## HIGH
 
 ### 1. Overlapping Execution / Resource Exhaustion in Main Loop
-- **File:** `extension.js` (Lines 319-373, inside `startLoop`)
+- **File:** `extension.js` (Lines 455-508, inside `startLoop`)
 - **Impact:** The extension uses `setInterval(async () => { ... }, 500)` to trigger auto-accepts and CDP retries. Because `setInterval` does not wait for the `async` callback to resolve, if any `vscode.commands.executeCommand` or CDP request takes longer than 500ms (e.g., due to a UI block or network delay), a new execution context is spawned. This leads to an unbounded stack of unresolved promises, heavy CPU utilization, and eventual IDE freezing (thundering herd).
 - **Fix:** Replace `setInterval` with a recursive `setTimeout`, or use an `isExecuting` lock.
   ```javascript
@@ -31,63 +31,51 @@ However, there are notable reliability, performance, and memory-leak issues that
   }, 500);
   ```
 
-### 2. Unbounded Execution of AI Commands (Security & Reliability)
-- **File:** `extension.js` (Lines 324-358)
-- **Impact:** The loop blindly accepts *all* agent and terminal commands every 500ms. If the AI agent hallucinates destructive commands (e.g., recursive deletion, dangerous script execution), this extension will approve them instantly without human oversight.
-- **Fix:** Implement a "kill switch" (e.g., disable auto-accept if >10 terminal commands are submitted within 5 seconds), and consider logging accepted terminal commands to the extension's Output Channel so the user has an audit trail.
+### 2. CDP Target Filtering Over-Matches (Security & Reliability)
+- **File:** `extension.js` (Lines 373-384)
+- **Impact:** The extension matches any target with `type === 'page' || type === 'webview'`, then runs `Runtime.evaluate` to click a button. This is too broad and can inject code into and click on unintended targets, like a user's regular Chrome browser if they are using the same CDP port.
+- **Fix:** Narrow the target filter to only match Antigravity-specific titles or URLs *before* opening a debugger WebSocket.
 
 ## MEDIUM
 
-### 1. Output Channel Resource Leak in Debug Command
-- **File:** `extension.js` (Line 118, inside `unlimited.listCommands`)
+### 1. getCDPTargets Unbounded Read
+- **File:** `extension.js` (Lines 208-217)
+- **Impact:** Concatenates the entire `http://localhost:${cdpPort}/json` response with no size cap. A wedged or unexpected listener on that port can inflate the extension host's memory.
+- **Fix:** Cap bytes in the `data` event and `destroy()` the request if it exceeds a reasonable limit (e.g. 5MB).
+
+### 2. enabled State is Not Persisted
+- **File:** `extension.js` (Line 5, Line 35)
+- **Impact:** `enabled` defaults to `true` and is memory-only. Users who turn auto-accept off lose that choice upon reload, as the extension activates on startup.
+- **Fix:** Persist the `enabled` state in settings or default it to `false` until explicit opt-in.
+
+### 3. Output Channel Resource Leak in Debug Command
+- **File:** `extension.js` (Line 124, inside `unlimited.listCommands`)
 - **Impact:** Every time the `unlimited.listCommands` command runs, a new output channel is instantiated via `vscode.window.createOutputChannel('Antigravity Commands')`. These channels are never disposed, leading to memory leaks and cluttering the Output view dropdown.
 - **Fix:** Reuse the globally defined `outputChannel` initialized during `activate`, or cache a single debug output channel.
 
-### 2. WebSocket Timeout Memory Leak
-- **File:** `extension.js` (Line 231, inside `executeScriptInTarget`)
-- **Impact:** A 3000ms `setTimeout` handles WebSocket timeouts but is never cleared if the socket resolves or errors early. This leaves dangling timers in the Node.js event loop on every CDP retry attempt.
-- **Fix:** Store the timer reference and clear it when the promise successfully resolves.
-  ```javascript
-  const timer = setTimeout(() => { ... }, 3000);
-  ws.on('message', (data) => {
-      clearTimeout(timer);
-      // ...
-  });
-  ```
+### 4. WebSocket and Interval Lifecycle Leaks
+- **File:** `extension.js` (Lines 311-317, 455, 510)
+- **Impact:** A 3000ms `setTimeout` handles WebSocket timeouts but is never cleared if the socket resolves or errors early. Additionally, `deactivate` does not abort in-flight websockets, and `startLoop` doesn't clear any existing interval before starting.
+- **Fix:** Store timer references and clear them on message/error/close. Track active websockets and abort them in `deactivate`. Clear existing intervals before starting new ones in `startLoop`.
 
-### 3. Inconsistent State When Settings Change Externally
-- **File:** `extension.js` (Line 28, `onDidChangeConfiguration` event)
+### 5. Inconsistent State When Settings Change Externally
+- **File:** `extension.js` (Lines 25-30, `onDidChangeConfiguration` event)
 - **Impact:** When `retryMaxCount` is updated via the command palette, `retryCurrentCount` is reset to 0. However, if updated directly via `.vscode/settings.json`, the configuration listener reloads settings but does not reset `retryCurrentCount`. This can instantly halt auto-retry if the new max is lower than the current count.
 - **Fix:** Inside `loadSettings()`, compare the incoming `retryMaxCount` with the old value and conditionally reset `retryCurrentCount`.
 
-### 4. Dead Code
-- **File:** `extension.js` (Line 186, `sendCDPCommand`)
-- **Impact:** The `sendCDPCommand` function is completely unused.
+### 6. Dead Code
+- **File:** `extension.js` (Lines 230-261, `sendCDPCommand`)
+- **Impact:** The `sendCDPCommand` function is completely unused, and also incorrectly POSTs to `/json/protocol`.
 - **Fix:** Remove it to improve maintainability and reduce file size.
-
-### 5. Zero Test Coverage (High-Risk Untested Paths)
-- **File:** Entire repository
-- **Impact:** There are absolutely no automated tests. Because this extension depends heavily on third-party VS Code command IDs (`antigravity.agent.acceptAgentStep`, etc.) and brittle DOM string matching, upstream changes will silently break this tool.
-- **Fix:** Implement an integration test suite using `@vscode/test-electron` to verify configuration behavior and command registration.
 
 ## LOW
 
 ### 1. Broad Catch Blocks Swallowing Errors
-- **File:** `extension.js` (Lines 325-358)
+- **File:** `extension.js` (Lines 462-501 and 445-451)
 - **Impact:** All commands are wrapped in `catch (e) {}`. If the Antigravity API fails legitimately, it does so silently.
-- **Fix:** Log exceptions to the global `outputChannel` (perhaps guarded by a debug flag) to aid in troubleshooting.
+- **Fix:** Differentiate between command not found errors and real API failures.
 
-### 2. Unvalidated Settings Loaded from Workspace
-- **File:** `extension.js` (Line 149, `loadSettings`)
-- **Impact:** While input box inputs are validated, settings loaded from `vscode.workspace.getConfiguration` are implicitly trusted. An invalid `cdpPort` (e.g., a string) in `settings.json` will silently break the CDP fetch.
-- **Fix:** Validate types and bounds in `loadSettings()` and fall back to safe defaults if invalid.
-
-### 3. Dynamic Require in Loop Callback
-- **File:** `extension.js` (Line 210, inside `executeScriptInTarget`)
-- **Impact:** `const WebSocket = require('ws');` is dynamically evaluated inside an often-called function instead of at module load time.
-- **Fix:** Move the require statement to the top of `extension.js`.
-
-### 4. Package Discoverability
-- **File:** `package.json` (Line 18)
-- **Impact:** The `categories` field is set to `["Other"]`, making it hard for users to find the extension.
-- **Fix:** Update to `["Machine Learning", "Other"]` or similar to improve indexing.
+### 2. Command Namespace Collisions
+- **File:** `package.json` (Lines 37-60)
+- **Impact:** Command IDs use `unlimited.*` instead of a scope tied to the extension's name (e.g., `antigravity-auto-accept.*`), which might cause collisions.
+- **Fix:** Rename command namespace to reduce collision risk.

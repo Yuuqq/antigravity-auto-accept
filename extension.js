@@ -2,7 +2,7 @@ const vscode = require('vscode');
 const http = require('http');
 
 let autoAcceptInterval = null;
-let enabled = true;
+let enabled = false;
 let autoRetryEnabled = true;
 let cdpPort = 9222;
 let retryMaxCount = 10;
@@ -11,6 +11,7 @@ let statusBarItem;
 let retryStatusBarItem;
 let lastRetryAttempt = 0;
 let outputChannel;
+let activeWebSockets = new Set();
 
 function activate(context) {
     // Create output channel for logging
@@ -33,6 +34,7 @@ function activate(context) {
     // Register toggle command for auto-accept
     let disposable = vscode.commands.registerCommand('unlimited.toggle', function () {
         enabled = !enabled;
+        vscode.workspace.getConfiguration('antigravity-auto-accept').update('enabled', enabled, true);
         updateStatusBar();
         if (enabled) {
             vscode.window.showInformationMessage('Auto-Accept: ON ✅');
@@ -121,8 +123,6 @@ function activate(context) {
             cmd.toLowerCase().includes('cockpit')
         );
 
-        const outputChannel = vscode.window.createOutputChannel('Antigravity Commands');
-        outputChannel.clear();
         outputChannel.appendLine('=== Antigravity Related Commands ===\n');
         antigravityCommands.sort().forEach(cmd => {
             outputChannel.appendLine(cmd);
@@ -159,8 +159,17 @@ function activate(context) {
 function loadSettings() {
     const config = vscode.workspace.getConfiguration('antigravity-auto-accept');
     cdpPort = config.get('cdpPort', 9222);
+    enabled = config.get('enabled', false);
     autoRetryEnabled = config.get('autoRetryEnabled', true);
-    retryMaxCount = config.get('retryMaxCount', 10);
+
+    const newRetryMaxCount = config.get('retryMaxCount', 10);
+    if (retryMaxCount !== newRetryMaxCount) {
+        // Reset count when max changes, or if new limit is below current count
+        if (newRetryMaxCount === 0 || retryCurrentCount >= newRetryMaxCount || newRetryMaxCount > retryMaxCount) {
+             retryCurrentCount = 0;
+        }
+        retryMaxCount = newRetryMaxCount;
+    }
 }
 
 function updateStatusBar() {
@@ -207,7 +216,13 @@ function getCDPTargets() {
     return new Promise((resolve, reject) => {
         const req = http.get(`http://localhost:${cdpPort}/json`, (res) => {
             let data = '';
-            res.on('data', chunk => data += chunk);
+            res.on('data', chunk => {
+                data += chunk;
+                // Cap payload size at 5MB
+                if (data.length > 5 * 1024 * 1024) {
+                    req.destroy(new Error('Response payload too large'));
+                }
+            });
             res.on('end', () => {
                 try {
                     resolve(JSON.parse(data));
@@ -221,42 +236,6 @@ function getCDPTargets() {
             req.destroy();
             reject(new Error('Timeout'));
         });
-    });
-}
-
-/**
- * Send CDP command via HTTP (simpler than WebSocket for one-off commands)
- */
-function sendCDPCommand(targetId, method, params = {}) {
-    return new Promise((resolve, reject) => {
-        const postData = JSON.stringify({
-            id: Date.now(),
-            method: method,
-            params: params
-        });
-
-        const req = http.request({
-            hostname: 'localhost',
-            port: cdpPort,
-            path: `/json/protocol`,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-            }
-        }, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => resolve(data));
-        });
-
-        req.on('error', reject);
-        req.setTimeout(2000, () => {
-            req.destroy();
-            reject(new Error('Timeout'));
-        });
-        req.write(postData);
-        req.end();
     });
 }
 
@@ -287,9 +266,25 @@ function executeScriptInTarget(wsUrl, script) {
                 }));
             });
 
+            activeWebSockets.add(ws);
+
+            let timeoutId = setTimeout(() => {
+                if (!resolved) {
+                    resolved = true;
+                    ws.close();
+                    reject(new Error('WebSocket timeout'));
+                }
+            }, 3000);
+
+            const cleanup = () => {
+                clearTimeout(timeoutId);
+                activeWebSockets.delete(ws);
+            };
+
             ws.on('message', (data) => {
                 if (!resolved) {
                     resolved = true;
+                    cleanup();
                     try {
                         const response = JSON.parse(data.toString());
                         resolve(response);
@@ -303,18 +298,18 @@ function executeScriptInTarget(wsUrl, script) {
             ws.on('error', (err) => {
                 if (!resolved) {
                     resolved = true;
+                    cleanup();
                     reject(err);
                 }
             });
 
-            // Timeout
-            setTimeout(() => {
+            ws.on('close', () => {
+                cleanup();
                 if (!resolved) {
                     resolved = true;
-                    ws.close();
-                    reject(new Error('WebSocket timeout'));
+                    resolve(null);
                 }
-            }, 3000);
+            });
         } catch (e) {
             reject(e);
         }
@@ -370,18 +365,23 @@ async function clickRetryViaCDP() {
         const targets = await getCDPTargets();
 
         // Find Antigravity Agent panel or relevant webview
-        const potentialTargets = targets.filter(t =>
-            t.type === 'page' || t.type === 'webview' ||
-            (t.title && (
+        const potentialTargets = targets.filter(t => {
+            const isRelevantType = t.type === 'page' || t.type === 'webview';
+            if (!isRelevantType) return false;
+
+            const hasRelevantTitle = t.title && (
                 t.title.includes('Antigravity') ||
                 t.title.includes('Agent') ||
                 t.title.includes('Chat')
-            )) ||
-            (t.url && (
+            );
+
+            const hasRelevantUrl = t.url && (
                 t.url.includes('workbench') ||
                 t.url.includes('webview')
-            ))
-        );
+            );
+
+            return hasRelevantTitle || hasRelevantUrl;
+        });
 
         // JavaScript to find and click Retry button (including inside iframes)
         const clickRetryScript = `
@@ -452,65 +452,91 @@ async function clickRetryViaCDP() {
     }
 }
 
+let isExecuting = false;
+
 function startLoop() {
-    autoAcceptInterval = setInterval(async () => {
-        if (!enabled) return;
+    if (autoAcceptInterval) {
+        clearTimeout(autoAcceptInterval);
+    }
 
-        // ========== AUTO-ACCEPT AGENT STEPS ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.acceptAgentStep');
-        } catch (e) { }
-
-        // ========== AUTO-ACCEPT TERMINAL COMMANDS ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.terminal.accept');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.terminalCommand.accept');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.command.accept');
-        } catch (e) { }
-
-        // ========== AUTO-CONFIRM STEP EXECUTION ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.confirmStep');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.confirm');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.confirm');
-        } catch (e) { }
-
-        // ========== AUTO-ALLOW PERMISSIONS ==========
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.allowOnce');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.agent.allowConversation');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.allowOnce');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('agCockpit.allowConversation');
-        } catch (e) { }
-        try {
-            await vscode.commands.executeCommand('antigravity.allow');
-        } catch (e) { }
-
-        // ========== AUTO-RETRY VIA CDP ==========
-        if (autoRetryEnabled) {
-            await clickRetryViaCDP();
+    const loop = async () => {
+        if (!enabled || isExecuting) {
+            autoAcceptInterval = setTimeout(loop, 500);
+            return;
         }
-    }, 500);
+
+        isExecuting = true;
+        try {
+            // ========== AUTO-ACCEPT AGENT STEPS ==========
+            try {
+                await vscode.commands.executeCommand('antigravity.agent.acceptAgentStep');
+            } catch (e) { }
+
+            // ========== AUTO-ACCEPT TERMINAL COMMANDS ==========
+            try {
+                await vscode.commands.executeCommand('antigravity.terminal.accept');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.terminalCommand.accept');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.command.accept');
+            } catch (e) { }
+
+            // ========== AUTO-CONFIRM STEP EXECUTION ==========
+            try {
+                await vscode.commands.executeCommand('antigravity.agent.confirmStep');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('agCockpit.confirm');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.confirm');
+            } catch (e) { }
+
+            // ========== AUTO-ALLOW PERMISSIONS ==========
+            try {
+                await vscode.commands.executeCommand('antigravity.agent.allowOnce');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.agent.allowConversation');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('agCockpit.allowOnce');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('agCockpit.allowConversation');
+            } catch (e) { }
+            try {
+                await vscode.commands.executeCommand('antigravity.allow');
+            } catch (e) { }
+
+            // ========== AUTO-RETRY VIA CDP ==========
+            if (autoRetryEnabled) {
+                await clickRetryViaCDP();
+            }
+        } finally {
+            isExecuting = false;
+            autoAcceptInterval = setTimeout(loop, 500);
+        }
+    };
+
+    autoAcceptInterval = setTimeout(loop, 500);
 }
 
 function deactivate() {
     if (autoAcceptInterval) {
-        clearInterval(autoAcceptInterval);
+        clearTimeout(autoAcceptInterval);
+        autoAcceptInterval = null;
     }
+    for (const ws of activeWebSockets) {
+        try {
+            ws.close();
+        } catch (e) {
+            // Ignore
+        }
+    }
+    activeWebSockets.clear();
 }
 
 module.exports = {

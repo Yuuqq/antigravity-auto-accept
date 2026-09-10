@@ -28,6 +28,11 @@
           "default": 9222,
           "description": "Chrome DevTools Protocol port for Antigravity remote debugging (--remote-debugging-port)"
         },
+        "antigravity-auto-accept.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable unlimited auto-accept"
+        },
         "antigravity-auto-accept.autoRetryEnabled": {
           "type": "boolean",
           "default": true,
